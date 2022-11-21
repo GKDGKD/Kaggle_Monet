@@ -6,7 +6,7 @@
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--batch_size', type=int, required=True, help='batch size')  # 必需参数
+parser.add_argument('--batch_size', type=int, default=32, help='batch size')  #required=True 必需参数
 parser.add_argument('--lr_rate', type=float, default=1e-3, help='learning rate')
 args = parser.parse_args()
 

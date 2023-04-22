@@ -2,3 +2,4 @@ data/
 result/
 test.ipynb
 CycleGAN/result/
+CycleGAN/test_gpt.py

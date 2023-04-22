@@ -1,6 +1,6 @@
 import torch
 import pandas as pd
-import os, sys
+import os
 import time
 import cv2 as cv
 from PIL import Image
@@ -20,7 +20,7 @@ from torchvision import datasets, models, transforms
 from torch.autograd import Variable
 from log.logutil import Logger
 from datasets import ImageDataset
-from model_kaggle import Generator, Discriminator, weights_init_normal
+from model_pytorch import GeneratorResNet, Discriminator, weights_init_normal
 from utils import ReplayBuffer, LambdaLR
 
 
@@ -29,7 +29,7 @@ parser.add_argument("--epoch_start", type=int, default=0, help="epoch to start t
 # parser.add_argument('--device', type=str, default='cuda:1', help='device to train model, cpu or cuda')
 parser.add_argument("--epochs", type=int, default=200, help="number of epochs of training")
 parser.add_argument("--dataset_name", type=str, default="monet2photo", help="name of the dataset")
-parser.add_argument("--batch_size", type=int, default=24, help="size of the batches")
+parser.add_argument("--batch_size", type=int, default=1, help="size of the batches")
 parser.add_argument("--lr", type=float, default=1E-3, help="adam: learning rate")
 parser.add_argument("--b1", type=float, default=0.5, help="adam: decay of first order momentum of gradient")
 parser.add_argument("--b2", type=float, default=0.999, help="adam: decay of first order momentum of gradient")
@@ -58,15 +58,15 @@ logger = Logger(log_id='',\
                 log_dir=save_dir).logger
 logger.setLevel(logging.DEBUG)
 # logger.set_sub_logger('wheat_test')
-
+logger.info(f'Local time: {save_time}')
 logger.info(opt)
 
 photo_path = '../data/photo_jpg'
 monet_path = '../data/monet_jpg'
 
 transform = transforms.Compose([
-    transforms.Resize(256),
-    transforms.RandomCrop((256, 256)),
+    transforms.Resize(int(opt.img_height * 1.12), Image.BICUBIC),
+    transforms.RandomCrop((opt.img_height, opt.img_width)),
     transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
     transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  #normalize效果特别好
@@ -93,7 +93,7 @@ logger.info(f"ds[0]['monet'].shape: {ds[0]['monet'].shape}")
 img_shape = tuple(ds[0]['photo'].shape)
 logger.info(f'img_shape: {img_shape}')
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logger.info(f'Device: {device}')
 logger.info('Buliding models...')
 
@@ -102,11 +102,13 @@ criterion_GAN = nn.MSELoss()
 criterion_cycle = nn.L1Loss()
 criterion_identity = nn.L1Loss()
 
+input_shape = (opt.channels, opt.img_height, opt.img_width)
+
 # Initialize generator and discriminator
-G_photo2monet = Generator()
-G_monet2photo = Generator()
-D_photo = Discriminator()
-D_monet = Discriminator()
+G_photo2monet = GeneratorResNet(input_shape, opt.n_residual_blocks)
+G_monet2photo = GeneratorResNet(input_shape, opt.n_residual_blocks)
+D_photo = Discriminator(input_shape)
+D_monet = Discriminator(input_shape)
 
 if torch.cuda.is_available():
     G_photo2monet.to(device)
@@ -114,7 +116,14 @@ if torch.cuda.is_available():
     D_monet.to(device)
     D_photo.to(device)
 
-if opt.epochs != 0:
+if opt.epoch_start != 0:
+    # Load pretrained models
+    G_photo2monet.load_state_dict(torch.load(f"{save_dir}/saved_models/G_photo2monet.pth"))
+    G_monet2photo.load_state_dict(torch.load(f"{save_dir}/saved_models/G_monet2photo.pth"))
+    D_photo.load_state_dict(torch.load(f"{save_dir}/saved_models/D_photo.pth"))
+    D_monet.load_state_dict(torch.load(f"{save_dir}/saved_models/D_monet.pth"))
+else:
+    # Initialize weights
     G_photo2monet.apply(weights_init_normal)
     G_monet2photo.apply(weights_init_normal)
     D_photo.apply(weights_init_normal)
@@ -155,12 +164,12 @@ def sample_images(batches_done, save_path):
     # Arange images along x-axis
     real_A = make_grid(real_A, nrow=5, normalize=True)
     real_B = make_grid(real_B, nrow=5, normalize=True)
-    fake_A = make_grid(denorm(fake_A), nrow=5, normalize=True)
-    fake_B = make_grid(denorm(fake_B), nrow=5, normalize=True)
-    logger.info(f'real_A.shape: {real_A.shape}, fake_A.shape: {fake_A.shape}')
+    fake_A = make_grid(fake_A, nrow=5, normalize=True)
+    fake_B = make_grid(fake_B, nrow=5, normalize=True)
+    # logger.info(f'real_A.shape: {real_A.shape}, fake_A.shape: {fake_A.shape}')
     # Arange images along y-axis
     image_grid = torch.cat((real_A, fake_B, real_B, fake_A), 1)
-    save_image(image_grid, f"{save_dir}{batches_done}.png", normalize=False)
+    save_image(image_grid, f"{save_dir}/pictures/{batches_done}.png", normalize=False)
 
 os.makedirs(f'{save_dir}/pictures')  
 os.makedirs(f'{save_dir}/saved_models')
@@ -187,7 +196,7 @@ for epoch in range(opt.epochs):
 
         optimizer_G.zero_grad()
 
-        # Identity loss
+        # Identity loss  B: 目标域monet, A:photo
         loss_id_photo = criterion_identity(G_monet2photo(real_photo), real_photo)
         loss_id_monet = criterion_identity(G_photo2monet(real_monet), real_monet)
         loss_identity = (loss_id_photo + loss_id_monet) / 2
@@ -254,27 +263,26 @@ for epoch in range(opt.epochs):
         time_left = datetime.timedelta(seconds=batches_left * (time.time() - prev_time))
         prev_time = time.time()
 
-        if i % 10 == 0:
         # Print log
-            logger.info(
-                "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, adv: %f, cycle: %f, identity: %f] ETA: %s"
-                % (
-                    epoch,
-                    opt.epochs,
-                    i,
-                    len(dataloader),
-                    loss_D.item(),
-                    loss_G.item(),
-                    loss_gan.item(),
-                    loss_cycle.item(),
-                    loss_identity.item(),
-                    time_left,
-                )
+        logger.info(
+            "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [G loss: %f, adv: %f, cycle: %f, identity: %f] ETA: %s"
+            % (
+                epoch,
+                opt.epochs,
+                i,
+                len(dataloader),
+                loss_D.item(),
+                loss_G.item(),
+                loss_gan.item(),
+                loss_cycle.item(),
+                loss_identity.item(),
+                time_left,
             )
+        )
 
         # If at sample interval save image
         if batches_done % opt.sample_interval == 0:
-            sample_images(batches_done, save_dir)
+            sample_images(batches_done, save_path)
 
         # Update learning rates
     lr_scheduler_G.step()
